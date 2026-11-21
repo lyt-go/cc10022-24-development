@@ -69,6 +69,41 @@ npm run dev
 | 主数据查询接口 | `mdm_api` | 查询接口 | 接口编号、实体模型、查询字段 |
 | 主数据治理看板 | `mdm_dashboard` | 看板配置 | 看板编号、看板名称、监控实体 |
 
+## 黄金记录版本发布与交付确认
+
+黄金记录版本的写入口径统一在 `backend/app/services/mdm_version.py`：
+
+- **完整快照**：每次版本写入都把整条黄金记录的字段与版本编号一起持久化
+  （`快照字段`），并在 `交付快照.字段` 中冻结一份不可变副本；`旧值摘要/新值摘要`
+  只作为变更说明，渠道不再依赖它取数。
+- **唯一发布版本**：同一黄金ID最多只有一个 `发布状态=已发布` 的版本，发布新版本
+  会把旧版本降为 `历史发布`；发布、回退、交付确认和黄金记录更新共用一把锁，
+  两段交接并发时不会各自发布出一个“当前版本”。
+- **交付确认**：只有当前发布版本可以确认交付，交付后写入 `交付状态/交付渠道/交付时间`
+  并返回带 `发布编号`、`版本号`、`快照编号`、`快照摘要` 的回执。
+- **渠道查询**：主数据查询接口和分发同步都只读当前发布版本的交付快照，
+  每条结果都带发布标识；同一黄金记录不会把新地址和旧区县拼在一起。
+- **可复算**：`recompute_published_result` 仅凭发布历史重建交付字段并校验摘要，
+  `verify_delivered_result` 逐字段核对渠道实际拿到的记录能否复算。
+
+对应接口：
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST | `/api/mdm_version/publish` | 确认发布（可指定 `version_number`） |
+| POST | `/api/mdm_version/delivery` | 交付确认并返回回执 |
+| GET | `/api/mdm_version/{golden_id}/published` | 当前发布版本及交付字段 |
+| GET | `/api/mdm_version/{golden_id}/history` | 发布历史（版本号降序） |
+| GET | `/api/mdm_version/{golden_id}/snapshot` | 按 `publish_id`/`version_number` 查交付快照 |
+| POST | `/api/mdm_version/verify` | 核对实际交付结果能否按发布历史复算 |
+| POST | `/api/mdm_api/query` | 渠道查询：只读当前发布快照 |
+| POST | `/api/mdm_api/publish` | 发布并用同一发布结果返回给渠道 |
+
+“黄金记录版本”工作台也提供 `确认发布`、`交付确认`、`标记历史`、`执行回滚` 动作。
+
+测试：`backend/.venv/bin/python app/tests/test_version_delivery.py`（版本发布与交付链路）
+与 `backend/.venv/bin/python app/tests/test_business_chains.py`（原有 6 条业务链路）。
+
 ## 约定
 
 - 全部模块共享`frontend/src/views/WorkbenchView.vue|tsx`和一套资源路由。

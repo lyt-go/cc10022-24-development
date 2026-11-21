@@ -26,7 +26,7 @@ class GoldenRecordService(BaseModuleService):
         设置置信度、关联来源和最后合并时间，生成唯一黄金ID。
         """
         rows = store.rows(self.MODULE)
-        golden_id = f"GR-{entity_model}-{datetime.datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
+        golden_id = self._new_golden_id(entity_model)
         confidence = self._compute_confidence(len(source_ids))
         entry = {
             "id": max((int(r.get("id", 0)) for r in rows), default=0) + 1,
@@ -47,8 +47,71 @@ class GoldenRecordService(BaseModuleService):
             if not key.startswith("_"):
                 entry[key] = val
         rows.append(entry)
-        # 写入黄金记录到golden_records存储，关联来源批次与合并追溯信息
-        return {"ok": True, "golden_record": entry}
+        # 首版即为交付基线：同步生成完整快照并确认发布，渠道从第一刻起
+        # 读到的就是带版本编号的发布结果。
+        from app.services.mdm_version import MdmVersionService, version_lock
+        version_svc = MdmVersionService()
+        with version_lock():
+            version_result = version_svc.snapshot_golden_version(
+                golden_id, dict(merged_data), changed_by="黄金记录创建")
+            published = version_svc.publish_golden_version(
+                golden_id, version_result["version_number"], changed_by="黄金记录创建")
+        return {"ok": True, "golden_record": entry,
+                "version": published.get("version"),
+                "publish_id": published.get("publish_id"),
+                "version_number": published.get("version_number")}
+
+    def update_golden_record(self, golden_id: str, updates: dict[str, Any],
+                             changed_by: str | None = None) -> dict[str, Any]:
+        """更新黄金记录字段并生成新版本快照（默认不自动发布）。
+
+        字段更新与快照写入在一次调用内完成，避免渠道读到地址已换、
+        区县未换的中间态；是否对外生效由显式发布决定。
+        """
+        from app.services.mdm_version import MdmVersionService, version_lock
+        with version_lock():
+            record = self._find_row(golden_id)
+            if record is None:
+                return {"ok": False, "reason": "黄金记录不存在"}
+            applied: dict[str, Any] = {}
+            for key, value in updates.items():
+                if key.startswith("_") or key in ("id", "status", "pending", "abnormal"):
+                    continue
+                record[key] = value
+                applied[key] = value
+            record["最后合并"] = datetime.datetime.utcnow().isoformat()
+
+            version_svc = MdmVersionService()
+            # 快照在锁内读取整条记录：同一客户的地址与区县要么一起进新版本，
+            # 要么都不进，不会和其他交接的改动拼成半新半旧。
+            snapshot = version_svc.snapshot_golden_version(
+                golden_id, applied, changed_by=changed_by or "黄金记录更新")
+        return {
+            "ok": True,
+            "golden_id": golden_id,
+            "updated_fields": applied,
+            "version": snapshot["version"],
+            "version_number": snapshot["version_number"],
+            "snapshot": snapshot["snapshot"],
+            "published": False,
+        }
+
+    def get_published_fields(self, golden_id: str) -> dict[str, Any] | None:
+        """读取黄金记录当前已确认发布版本的字段（渠道查询唯一数据源）。"""
+        from app.services.mdm_version import MdmVersionService
+        return MdmVersionService().get_published_fields(golden_id)
+
+    def _new_golden_id(self, entity_model: str) -> str:
+        """生成唯一黄金ID：同一秒内多次创建也不会撞号。"""
+        rows = store.rows(self.MODULE)
+        existing = {str(row.get("黄金ID", "")) for row in rows}
+        base = f"GR-{entity_model}-{datetime.datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
+        if base not in existing:
+            return base
+        suffix = 2
+        while f"{base}-{suffix}" in existing:
+            suffix += 1
+        return f"{base}-{suffix}"
 
     def _compute_confidence(self, source_count: int) -> float:
         """计算黄金记录置信度：基于来源数量和质量指标综合评估。"""
@@ -62,11 +125,14 @@ class GoldenRecordService(BaseModuleService):
         查询黄金记录的完整字段信息、关联来源列表和置信度评分，
         返回黄金记录的完整快照数据。
         """
-        rows = store.rows(self.MODULE)
-        for row in rows:
+        row = self._find_row(golden_id)
+        return dict(row) if row is not None else None
+
+    def _find_row(self, golden_id: str) -> dict[str, Any] | None:
+        """返回存储中的原始行，供需要写回字段的服务复用。"""
+        for row in store.rows(self.MODULE):
             if row.get("黄金ID") == golden_id:
-                # 查询黄金记录完整信息：包含关联来源和置信度
-                return dict(row)
+                return row
         return None
 
     def link_source_to_golden(self, golden_id: str, new_source_id: str) -> dict[str, Any]:
@@ -75,7 +141,7 @@ class GoldenRecordService(BaseModuleService):
         将新增来源记录关联到已有黄金记录，更新关联来源列表，
         重新计算置信度评分并更新最后合并时间。
         """
-        record = self.query_golden_record(golden_id)
+        record = self._find_row(golden_id)
         if not record:
             return {"ok": False, "reason": "黄金记录不存在"}
         sources = record.get("关联来源", "").split("|")
@@ -97,7 +163,7 @@ class GoldenRecordService(BaseModuleService):
         查询黄金记录数据，读取golden_records存储中的字段值，
         校验必填字段完整性并输出完备率统计。
         """
-        record = self.query_golden_record(golden_id)
+        record = self._find_row(golden_id)
         if not record:
             return {"ok": False, "reason": "黄金记录不存在"}
         missing = [f for f in required_fields if not str(record.get(f, "")).strip()]

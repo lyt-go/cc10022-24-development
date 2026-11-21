@@ -20,20 +20,20 @@ class MdmSyncService(BaseModuleService):
     def sync_golden_to_target(self, sync_id: int) -> dict[str, Any]:
         """将黄金记录分发同步到目标系统。
 
-        读取同步配置，按字段范围和同步方式将黄金记录
-        导出并分发到目标业务系统，处理冲突检测和同步策略。
+        读取同步配置，按字段范围和同步方式将**已确认发布版本**的交付字段
+        分发到目标业务系统，处理冲突检测和同步策略；同一黄金记录只取一个版本。
         """
         sync_cfg = self.get_entry(sync_id)
         if not sync_cfg or sync_cfg.get("status") != "同步中":
             return {"ok": False, "reason": "同步配置不可用"}
-        from app.services.golden_record import GoldenRecordService
-        golden_svc = GoldenRecordService()
+        from app.services.mdm_api import MdmApiService
         entity = sync_cfg.get("黄金实体", "")
         fields_str = sync_cfg.get("字段范围", "")
         fields = [f.strip() for f in fields_str.split(",") if f.strip()]
 
-        records = golden_svc.search_golden_records(entity_model=entity)
-        # 分发同步黄金记录：按字段范围筛选并导出到目标系统
+        published = MdmApiService().published_records_for_entity(entity)
+        records = published
+        # 分发同步黄金记录：按字段范围裁剪已发布快照字段后导出到目标系统
         if fields:
             records = [{f: r.get(f) for f in fields if f in r} for r in records]
         return {
@@ -41,6 +41,8 @@ class MdmSyncService(BaseModuleService):
             "sync_id": sync_cfg.get("配置编号"),
             "target": sync_cfg.get("目标系统"),
             "synced_count": len(records),
+            "version_numbers": sorted({str(r.get("版本号", "")) for r in published}),
+            "source": "发布快照",
             "records": records,
         }
 
